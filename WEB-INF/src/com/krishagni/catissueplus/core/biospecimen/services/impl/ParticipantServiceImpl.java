@@ -67,41 +67,6 @@ public class ParticipantServiceImpl implements ParticipantService, ObjectAccesso
 	}
 
 	@Override
-	@PlusTransactional
-	public ResponseEvent<ParticipantDetail> createParticipant(RequestEvent<ParticipantDetail> req) {
-		try {
-			Participant participant = participantFactory.createParticipant(req.getPayload());
-			participant = createParticipant(participant);
-			return ResponseEvent.response(ParticipantDetail.from(participant, false));
-		} catch (OpenSpecimenException ose) {
-			return ResponseEvent.error(ose);
-		} catch (Exception e) {
-			return ResponseEvent.serverError(e);
-		}
-	}
-	
-	@Override
-	@PlusTransactional
-	public ResponseEvent<ParticipantDetail> updateParticipant(RequestEvent<ParticipantDetail> req) {
-		try {
-			ParticipantDetail detail = req.getPayload();
-			Participant existing = getParticipant(detail, true);
-			if (existing == null) {
-				return ResponseEvent.userError(ParticipantErrorCode.NOT_FOUND);
-			}
-
-			
-			Participant participant = participantFactory.createParticipant(detail);
-			updateParticipant(existing, participant);			
-			return ResponseEvent.response(ParticipantDetail.from(existing, false));
-		} catch (OpenSpecimenException ose) {
-			return ResponseEvent.error(ose);
-		} catch (Exception e) {
-			return ResponseEvent.serverError(e);
-		}
-	}
-	
-	@Override
 	public ResponseEvent<ParticipantDetail> patchParticipant(RequestEvent<ParticipantDetail> req) {
 		try {
 			ParticipantDetail detail = req.getPayload();
@@ -111,6 +76,7 @@ public class ParticipantServiceImpl implements ParticipantService, ObjectAccesso
 			}
 			
 			Participant participant = participantFactory.createParticipant(existing, detail);
+			ensurePhiAccess(existing, participant);
 			updateParticipant(existing, participant);			
 			return ResponseEvent.response(ParticipantDetail.from(existing, false));
 		} catch (OpenSpecimenException ose) {
@@ -145,11 +111,16 @@ public class ParticipantServiceImpl implements ParticipantService, ObjectAccesso
 	public ResponseEvent<List<MatchedParticipantsList>> getMatchingParticipants(RequestEvent<List<ParticipantDetail>> req) {
 		try {
 			List<MatchedParticipantsList> result = new ArrayList<>();
+			boolean unrestrictedAccess = AccessCtrlMgr.getInstance().canCreateUpdateParticipant();
 
 			for (ParticipantDetail inputCrit : req.getPayload()) {
 				List<MatchedParticipant> matchedParticipants = lookupFactory.getLookupLogic().getMatchingParticipants(inputCrit);
-				if (inputCrit.isReqRegInfo()) {
-					addRegInfo(matchedParticipants);
+				if (unrestrictedAccess) {
+					if (inputCrit.isReqRegInfo()) {
+						addRegInfo(matchedParticipants);
+					}
+				} else {
+					matchedParticipants = getAccessibleMatches(inputCrit, matchedParticipants);
 				}
 
 				result.add(MatchedParticipantsList.from(inputCrit, matchedParticipants));
@@ -163,15 +134,23 @@ public class ParticipantServiceImpl implements ParticipantService, ObjectAccesso
 		}
 	}
 	
-	public Participant createParticipant(Participant participant) {
+	@Override
+	public Participant getMatchingParticipant(ParticipantDetail detail) {
+		return getParticipant(detail, false);
+	}
+
+	@Override
+	public Participant createParticipant(Participant participant, boolean generateEmpi) {
 		OpenSpecimenException ose = new OpenSpecimenException(ErrorType.USER_ERROR);
 		ParticipantUtil.ensureUniqueUid(daoFactory, participant.getUid(), ose);
 		ParticipantUtil.ensureUniquePmis(daoFactory, PmiDetail.from(participant.getPmis(), false), participant, ose);
 		ParticipantUtil.ensureUniqueEmpi(daoFactory, participant.getEmpi(), ose);
 
 		ose.checkAndThrow();
+		if (generateEmpi) {
+			participant.setEmpiIfEmpty();
+		}
 
-		participant.setEmpiIfEmpty();
 		daoFactory.getParticipantDao().saveOrUpdate(participant, true);
 		return participant;
 	}
@@ -204,15 +183,19 @@ public class ParticipantServiceImpl implements ParticipantService, ObjectAccesso
 	}
 
 	@Override
-	public ParticipantDetail saveOrUpdateParticipant(ParticipantDetail detail) {
+	public ParticipantDetail saveOrUpdateParticipant(ParticipantDetail detail, boolean generateEmpi, boolean checkUpdateAccess) {
 		Participant existing = getParticipant(detail, false);
 
 		if (existing == null) {
 			Participant participant = participantFactory.createParticipant(detail);
-			participant = createParticipant(participant);
+			participant = createParticipant(participant, generateEmpi);
 			return ParticipantDetail.from(participant, false);
 		} else {
 			Participant participant = participantFactory.createParticipant(existing, detail);
+			if (checkUpdateAccess) {
+				ensurePhiAccess(existing, participant);
+			}
+
 			updateParticipant(existing, participant);
 			return ParticipantDetail.from(existing, false);
 		}
@@ -255,7 +238,21 @@ public class ParticipantServiceImpl implements ParticipantService, ObjectAccesso
 		
 		return result;
 	}
-	
+
+	private void ensurePhiAccess(Participant existing, Participant participant) {
+		boolean phiAccess = AccessCtrlMgr.getInstance().ensureUpdateParticipantWithDeidRights(existing);
+		if (phiAccess) {
+			return;
+		}
+
+		if (existing.hasPhi() || participant.hasPhi()) {
+			String cpShortTitle = existing.getCprs().stream()
+				.map(CollectionProtocolRegistration::getCpShortTitle)
+				.findFirst().orElse("");
+			throw OpenSpecimenException.userError(ParticipantErrorCode.CANNOT_UPDATE_PHI, cpShortTitle);
+		}
+	}
+
 	private Participant getByPmis(ParticipantDetail detail) {
 		Participant result = null;
 		
@@ -273,23 +270,51 @@ public class ParticipantServiceImpl implements ParticipantService, ObjectAccesso
 		return result;
 	}
 
-	//
-	// TODO: We are assuming there won't be many matched participants;
-	// If this is slow then we need to issue a single query to obtain
-	// reg info of all matched participants at one go
-	//
+	private List<MatchedParticipant> getAccessibleMatches(ParticipantDetail criteria, List<MatchedParticipant> matchedParticipants) {
+		List<MatchedParticipant> result = new ArrayList<>();
+		for (MatchedParticipant match : matchedParticipants) {
+			MatchedParticipant accessibleMatch = getAccessibleMatch(criteria.isReqRegInfo(), match);
+			if (accessibleMatch != null) {
+				result.add(accessibleMatch);
+			}
+		}
+
+		return result;
+	}
+
+	private MatchedParticipant getAccessibleMatch(boolean reqRegInfo, MatchedParticipant match) {
+		ParticipantDetail detail = match.getParticipant();
+		if (detail.getId() == null) {
+			return null;
+		}
+
+		Participant participant = daoFactory.getParticipantDao().getById(detail.getId());
+		if (participant == null) {
+			return null;
+		}
+
+		try {
+			boolean phiAccess = AccessCtrlMgr.getInstance().ensureReadParticipantRights(participant);
+			List<CollectionProtocolRegistration> cprs = reqRegInfo ? getCprs(participant) : null;
+			detail = ParticipantDetail.from(participant, !phiAccess, cprs);
+			return new MatchedParticipant(detail, match.getMatchedAttrs());
+		} catch (OpenSpecimenException ose) {
+			return null;
+		}
+	}
+
 	private void addRegInfo(List<MatchedParticipant> matchedParticipants) {
 		matchedParticipants.forEach(this::addRegInfo);
 	}
 
 	private void addRegInfo(MatchedParticipant matchedParticipant) {
 		ParticipantDetail detail = matchedParticipant.getParticipant();
-		if (detail.getId() == null) {
-			return;
+		if (detail.getId() != null) {
+			Participant participant = daoFactory.getParticipantDao().getById(detail.getId());
+			if (participant != null) {
+				detail.setRegisteredCps(ParticipantDetail.getCprSummaries(getCprs(participant)));
+			}
 		}
-
-		Participant participant = daoFactory.getParticipantDao().getById(detail.getId());
-		detail.setRegisteredCps(ParticipantDetail.getCprSummaries(getCprs(participant)));
 	}
 
 	private List<CollectionProtocolRegistration> getCprs(Participant participant) {

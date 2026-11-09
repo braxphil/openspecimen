@@ -9,6 +9,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
+import java.util.function.BooleanSupplier;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -48,6 +49,7 @@ import com.krishagni.catissueplus.core.biospecimen.domain.factory.ParticipantErr
 import com.krishagni.catissueplus.core.biospecimen.domain.factory.SpecimenErrorCode;
 import com.krishagni.catissueplus.core.biospecimen.domain.factory.VisitErrorCode;
 import com.krishagni.catissueplus.core.common.Pair;
+import com.krishagni.catissueplus.core.common.PlusTransactional;
 import com.krishagni.catissueplus.core.common.errors.ErrorType;
 import com.krishagni.catissueplus.core.common.errors.OpenSpecimenException;
 import com.krishagni.catissueplus.core.common.events.Operation;
@@ -105,6 +107,35 @@ public class AccessCtrlMgr {
 	//          User object access control helper methods                               //
 	//                                                                                  //
 	//////////////////////////////////////////////////////////////////////////////////////
+	public boolean canReadFullUserDetails(Long userId, Long instituteId, String userType) {
+		return canReadFullUserDetails(userId, instituteId, userType, this::canCreateOrUpdateUsers);
+	}
+
+	public boolean canReadFullUserDetails(Long userId, Long instituteId, String userType, BooleanSupplier canCreateOrUpdateUsers) {
+		User currentUser = AuthUtil.getCurrentUser();
+		if (currentUser == null) {
+			return false;
+		}
+
+		Long currUserInstId = currentUser.getInstitute() != null ? currentUser.getInstitute().getId() : null;
+		return currentUser.isAdmin() ||
+			(instituteId != null && currentUser.isInstituteAdmin() && instituteId.equals(currUserInstId)) ||
+			(userId != null && userId.equals(currentUser.getId())) || // self profile
+			(
+				(
+					User.Type.CONTACT.name().equals(userType) || // user being edited is contact
+					(instituteId != null && instituteId.equals(currUserInstId)) // or belongs to the same institute as editor
+				) &&
+				canCreateOrUpdateUsers.getAsBoolean() // and has user create/update rights
+			);
+	}
+
+	@PlusTransactional
+	public boolean canCreateOrUpdateUsers() {
+		return AuthUtil.getCurrentUser() != null &&
+			canUserPerformOp(Resource.USER, new Operation[] {Operation.CREATE, Operation.UPDATE});
+	}
+
 	public void ensureCreateUserRights(User user) {
 		ensureUserObjectRights(user, Operation.CREATE, true);
 		ensureUserEximRights(user, true);
@@ -131,6 +162,31 @@ public class AccessCtrlMgr {
 	public void ensureDeleteUserRights(User user) {
 		ensureUserObjectRights(user, Operation.DELETE, true);
 		ensureUserEximRights(user, true);
+	}
+
+	public void ensureReadUserRolesRights(User user) {
+		User currentUser = AuthUtil.getCurrentUser();
+		if (currentUser == null) {
+			throw OpenSpecimenException.userError(RbacErrorCode.ACCESS_DENIED);
+		}
+
+		if (currentUser.isAdmin() || currentUser.equals(user)) {
+			return;
+		}
+
+		if (!currentUser.getInstitute().equals(user.getInstitute())) {
+			throw OpenSpecimenException.userError(RbacErrorCode.ACCESS_DENIED);
+		}
+
+		if (currentUser.isInstituteAdmin()) {
+			return;
+		}
+
+		if (canUserPerformOp(currentUser.getId(), Resource.USER, new Operation[] { Operation.UPDATE })) {
+			return;
+		}
+
+		throw OpenSpecimenException.userError(RbacErrorCode.ACCESS_DENIED);
 	}
 
 	public void ensureCreateUpdateUserRolesRights(User user, Site roleSite, CollectionProtocol roleCp) {
@@ -403,6 +459,10 @@ public class AccessCtrlMgr {
 		return getSiteCps(Resource.CP, Operation.READ, false);
 	}
 
+	public Set<SiteCpPair> getCatalogReadableSiteCps() {
+		return getSiteCps(Resource.CATALOG, Operation.READ, false);
+	}
+
 	public String getAllowedCpIdsSql(Collection<SiteCpPair> siteCps) {
 		if (siteCps == null) {
 			return "";
@@ -437,7 +497,22 @@ public class AccessCtrlMgr {
 	}
 
 	public Set<Long> getRegisterEnabledCpIds(List<String> siteNames) {
-		return getEligibleCpIds(Resource.PARTICIPANT.getName(), new String[] {Operation.CREATE.getName()}, siteNames);
+		String[] ops = new String[] {Operation.CREATE.getName()};
+		Set<Long> cpIds = getEligibleCpIds(Resource.PARTICIPANT.getName(), ops, siteNames);
+		if (cpIds == null) {
+			//
+			// null means all CPs
+			//
+			return null;
+		}
+
+		Set<Long> deidCpIds = getEligibleCpIds(Resource.PARTICIPANT_DEID.getName(), ops, siteNames);
+		if (deidCpIds == null) {
+			return null;
+		}
+
+		cpIds.addAll(deidCpIds);
+		return cpIds;
 	}
 
 	public Set<Long> getReadAccessGroupCpIds(Long groupId) {
@@ -666,6 +741,10 @@ public class AccessCtrlMgr {
 		return ensureParticipantObjectRights(participant, Operation.UPDATE);
 	}
 
+	public boolean ensureUpdateParticipantWithDeidRights(Participant participant) {
+		return ensureParticipantObjectRights(participant, Operation.UPDATE, true);
+	}
+
 	public List<CollectionProtocolRegistration> getAccessibleCprs(Collection<CollectionProtocolRegistration> cprs) {
 		return getAccessibleCprs(cprs, Operation.READ);
 	}
@@ -689,6 +768,19 @@ public class AccessCtrlMgr {
 	public boolean ensureCreateCprRights(CollectionProtocolRegistration cpr) {
 		boolean phiAccess = ensureCprObjectRights(cpr, Operation.CREATE);
 		ensureCprEximRights(cpr);
+		return phiAccess;
+	}
+
+	public boolean ensureCreateOrUpdateCprRights(CollectionProtocolRegistration existing, CollectionProtocolRegistration cpr) {
+		if (existing == null) {
+			return ensureCprObjectRightsWithDeid(cpr, Operation.CREATE);
+		}
+
+		boolean phiAccess = ensureCprObjectRightsWithDeid(existing, Operation.UPDATE);
+		if (isCprAccessScopeChanged(existing, cpr)) {
+			phiAccess &= ensureCprObjectRightsWithDeid(cpr, Operation.UPDATE);
+		}
+
 		return phiAccess;
 	}
 
@@ -743,32 +835,61 @@ public class AccessCtrlMgr {
 	}
 
 	private boolean ensureParticipantObjectRights(Participant p, Operation op) {
+		return ensureParticipantObjectRights(p, op, op == Operation.READ);
+	}
+
+	private boolean ensureParticipantObjectRights(Participant p, Operation op, boolean allowDeid) {
+		boolean deidAccess = false;
 		for (CollectionProtocolRegistration cpr : p.getCprs()) {
 			try {
-				return ensureCprObjectRights(cpr, op);
+				if (ensureCprObjectRights(cpr, op, allowDeid)) {
+					return true;
+				}
+
+				deidAccess = true;
 			} catch (OpenSpecimenException ose) {
 
 			}
+		}
+
+		if (deidAccess) {
+			return false;
 		}
 
 		throw OpenSpecimenException.userError(RbacErrorCode.ACCESS_DENIED);
 	}
 
 	private boolean ensureCprObjectRights(CollectionProtocolRegistration cpr, Operation op) {
+		return ensureCprObjectRights(cpr, op, op == Operation.READ);
+	}
+
+	private boolean ensureCprObjectRightsWithDeid(CollectionProtocolRegistration cpr, Operation op) {
+		boolean phiAccess = ensureCprObjectRights(cpr, op, true);
+		ensureCprEximRights(cpr, phiAccess);
+		return phiAccess;
+	}
+
+	private boolean ensureCprObjectRights(CollectionProtocolRegistration cpr, Operation op, boolean allowDeid) {
+		return ensureCprObjectRights(cpr, op, Resource.PARTICIPANT, allowDeid);
+	}
+
+	private boolean ensureCprObjectRights(
+		CollectionProtocolRegistration cpr, Operation op, Resource resourceType, boolean allowDeid) {
+
 		if (AuthUtil.isAdmin()) {
 			return true;
 		}
 
-		boolean phiAccess = true;
+		boolean phiAccess = resourceType == Resource.PARTICIPANT;
 		Long cpId = cpr.getCollectionProtocol().getId();
-		String resource = Resource.PARTICIPANT.getName();
+		String resource = resourceType.getName();
 		Long userId = AuthUtil.getCurrentUser().getId();
 		String[] ops = {op.getName()};
 
 		List<SubjectAccess> accessList = daoFactory.getSubjectDao().getAccessList(userId, cpId, resource, ops);
 		Set<Site> cpSites = cpr.getCollectionProtocol().getRepositories();
 		boolean allowed = isAccessAllowedOnAnySite(accessList, cpSites);
-		if (!allowed && op == Operation.READ) {
+		if (!allowed && allowDeid && resourceType == Resource.PARTICIPANT) {
 			phiAccess = false;
 			resource = Resource.PARTICIPANT_DEID.getName();
 			accessList = daoFactory.getSubjectDao().getAccessList(userId, cpId, resource, ops);
@@ -796,9 +917,19 @@ public class AccessCtrlMgr {
 		return phiAccess;
 	}
 
+	private boolean isCprAccessScopeChanged(CollectionProtocolRegistration existing, CollectionProtocolRegistration cpr) {
+		return !Objects.equals(existing.getCollectionProtocol(), cpr.getCollectionProtocol()) ||
+			!Objects.equals(existing.getParticipant().getMrnSites(), cpr.getParticipant().getMrnSites());
+	}
+
 	private void ensureCprEximRights(CollectionProtocolRegistration cpr) {
+		ensureCprEximRights(cpr, true);
+	}
+
+	private void ensureCprEximRights(CollectionProtocolRegistration cpr, boolean phiAccess) {
 		if (isImportOp() || isExportOp()) {
-			ensureCprObjectRights(cpr, Operation.EXIM);
+			Resource resource = phiAccess ? Resource.PARTICIPANT : Resource.PARTICIPANT_DEID;
+			ensureCprObjectRights(cpr, Operation.EXIM, resource, false);
 		}
 	}
 
@@ -1774,6 +1905,10 @@ public class AccessCtrlMgr {
 		ensureShipmentRights(shipment, Operation.UPDATE);
 	}
 
+	public void ensureUpdateShipmentTransitionRights(Shipment shipment) {
+		ensureShipmentRights(shipment, Operation.UPDATE, true);
+	}
+
 	public void ensureDeleteShipmentRights(Shipment shipment) {
 		ensureShipmentRights(shipment, Operation.DELETE);
 	}
@@ -1783,6 +1918,10 @@ public class AccessCtrlMgr {
 	}
 
 	private void ensureShipmentRights(Shipment shipment, Operation op) {
+		ensureShipmentRights(shipment, op, false);
+	}
+
+	private void ensureShipmentRights(Shipment shipment, Operation op, boolean allowReceiverForShipped) {
 		if (AuthUtil.isAdmin()) {
 			return;
 		}
@@ -1804,12 +1943,11 @@ public class AccessCtrlMgr {
 			allowed = true; // sender can update/delete
 		}
 
-		if (!allowed && shipment.isReceived() && isAccessAllowedOnSite(allowedSites, shipment.getReceivingSite())) {
-			allowed = true; // receiver can update / delete
-		}
-
-		if (!allowed && shipment.isRequest() && shipment.isRequested() && isAccessAllowedOnSite(allowedSites, shipment.getReceivingSite())) {
-			allowed = true; // requester/receiver can modify submitted requests
+		boolean receivingSiteAllowed = shipment.isReceived() ||
+			(shipment.isRequest() && shipment.isRequested()) ||
+			(allowReceiverForShipped && shipment.isShipped());
+		if (!allowed && receivingSiteAllowed && isAccessAllowedOnSite(allowedSites, shipment.getReceivingSite())) {
+			allowed = true;
 		}
 
 		if (!allowed) {

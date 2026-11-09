@@ -3,6 +3,8 @@ package com.krishagni.catissueplus.core.de.events;
 
 import org.apache.commons.lang3.StringUtils;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
+
 public class ExecuteQueryEventOp  {
 
 	private String querySpace;
@@ -35,6 +37,13 @@ public class ExecuteQueryEventOp  {
 	// mostly used by the list generator API
 	//
 	private boolean disableAccessChecks;
+
+	//
+	// Set only by trusted catalog services. Catalog queries do not require
+	// Query read rights. CP-scoped queries use CP read rights; unscoped
+	// queries use Catalog read rights.
+	//
+	private boolean catalogQuery;
 
 	//
 	// mostly used by the list generator API
@@ -159,6 +168,7 @@ public class ExecuteQueryEventOp  {
 		this.synchronous = synchronous;
 	}
 
+	@JsonIgnore
 	public boolean isDisableAccessChecks() {
 		return disableAccessChecks;
 	}
@@ -167,6 +177,16 @@ public class ExecuteQueryEventOp  {
 		this.disableAccessChecks = disableAccessChecks;
 	}
 
+	@JsonIgnore
+	public boolean isCatalogQuery() {
+		return catalogQuery;
+	}
+
+	public void setCatalogQuery(boolean catalogQuery) {
+		this.catalogQuery = catalogQuery;
+	}
+
+	@JsonIgnore
 	public boolean isDisableAuditing() {
 		return disableAuditing;
 	}
@@ -191,6 +211,7 @@ public class ExecuteQueryEventOp  {
 		this.reportName = reportName;
 	}
 
+	@JsonIgnore
 	public String getQueryUid() {
 		return queryUid;
 	}
@@ -199,6 +220,7 @@ public class ExecuteQueryEventOp  {
 		this.queryUid = queryUid;
 	}
 
+	@JsonIgnore
 	public boolean isUseReportingDataSource() {
 		return useReportingDataSource;
 	}

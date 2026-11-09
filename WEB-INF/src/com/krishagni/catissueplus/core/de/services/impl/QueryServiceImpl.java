@@ -38,10 +38,13 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BiConsumer;
+import java.util.function.BiFunction;
 import java.util.stream.Collectors;
 
 import javax.sql.DataSource;
 
+import org.antlr.v4.runtime.CharStreams;
+import org.antlr.v4.runtime.Token;
 import org.apache.commons.collections4.CollectionUtils;
 import org.apache.commons.io.FileUtils;
 import org.apache.commons.io.IOUtils;
@@ -49,18 +52,23 @@ import org.apache.commons.lang3.ArrayUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.hibernate.SessionFactory;
 import org.springframework.beans.factory.InitializingBean;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.core.io.Resource;
 import org.springframework.core.io.support.PathMatchingResourcePatternResolver;
 import org.springframework.dao.QueryTimeoutException;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.web.util.HtmlUtils;
-
 import com.krishagni.catissueplus.core.administrative.domain.ScheduledJob;
 import com.krishagni.catissueplus.core.administrative.domain.User;
 import com.krishagni.catissueplus.core.administrative.domain.factory.UserErrorCode;
 import com.krishagni.catissueplus.core.administrative.repository.UserDao;
 import com.krishagni.catissueplus.core.administrative.services.ScheduledTaskManager;
+import com.krishagni.catissueplus.core.biospecimen.domain.BaseEntity;
+import com.krishagni.catissueplus.core.biospecimen.domain.CollectionProtocol;
+import com.krishagni.catissueplus.core.biospecimen.domain.CollectionProtocolGroup;
+import com.krishagni.catissueplus.core.biospecimen.domain.factory.CpErrorCode;
+import com.krishagni.catissueplus.core.biospecimen.domain.factory.CpGroupErrorCode;
 import com.krishagni.catissueplus.core.biospecimen.repository.impl.BiospecimenDaoHelper;
 import com.krishagni.catissueplus.core.common.OpenSpecimenAppCtxProvider;
 import com.krishagni.catissueplus.core.common.Pair;
@@ -70,6 +78,7 @@ import com.krishagni.catissueplus.core.common.access.AccessCtrlMgr.ParticipantRe
 import com.krishagni.catissueplus.core.common.access.SiteCpPair;
 import com.krishagni.catissueplus.core.common.domain.Notification;
 import com.krishagni.catissueplus.core.common.errors.CommonErrorCode;
+import com.krishagni.catissueplus.core.common.errors.ErrorCode;
 import com.krishagni.catissueplus.core.common.errors.OpenSpecimenException;
 import com.krishagni.catissueplus.core.common.events.EntityQueryCriteria;
 import com.krishagni.catissueplus.core.common.events.ExportedFileDetail;
@@ -130,14 +139,15 @@ import edu.common.dynamicextensions.query.QueryException;
 import edu.common.dynamicextensions.query.QueryParserException;
 import edu.common.dynamicextensions.query.QueryRejectedException;
 import edu.common.dynamicextensions.query.QueryResponse;
-import edu.common.dynamicextensions.query.QueryRiskAssessmentConfig;
 import edu.common.dynamicextensions.query.QueryResultCsvExporter;
 import edu.common.dynamicextensions.query.QueryResultData;
 import edu.common.dynamicextensions.query.QueryResultExporter;
 import edu.common.dynamicextensions.query.QueryResultScreener;
+import edu.common.dynamicextensions.query.QueryRiskAssessmentConfig;
 import edu.common.dynamicextensions.query.QuerySpace;
 import edu.common.dynamicextensions.query.ResultColumn;
 import edu.common.dynamicextensions.query.WideRowMode;
+import edu.common.dynamicextensions.query.antlr.AQLLexer;
 
 public class QueryServiceImpl implements QueryService, InitializingBean {
 	private static final LogUtil logger = LogUtil.getLogger(QueryServiceImpl.class);
@@ -177,6 +187,9 @@ public class QueryServiceImpl implements QueryService, InitializingBean {
 	private static final ExecutorService exportThreadPool = Executors.newFixedThreadPool(EXPORT_THREAD_POOL_SIZE);
 
 	private DaoFactory daoFactory;
+
+	@Autowired
+	private com.krishagni.catissueplus.core.biospecimen.repository.DaoFactory biospecimenDaoFactory;
 
 	private UserDao userDao;
 	
@@ -405,13 +418,14 @@ public class QueryServiceImpl implements QueryService, InitializingBean {
 				mode = WideRowMode.valueOf(queryDetail.getWideRowMode());
 			}
 
+			String aql = getAql(queryDetail);
 			Query.createQuery()
 				.wideRowMode(mode)
 				.ic(!queryDetail.isCaseSensitive())
 				.dateFormat(ConfigUtil.getInstance().getDeDateFmt())
 				.timeFormat(ConfigUtil.getInstance().getTimeFmt())
 				.assessQueryRisk(riskAssessmentConfig)
-				.compile(cprForm, getAql(queryDetail));
+				.compile(getDrivingForm(null, queryDetail.getDrivingForm(), aql), aql);
 			SavedQuery savedQuery = getSavedQuery(queryDetail);
 			daoFactory.getSavedQueryDao().saveOrUpdate(savedQuery);
 			return ResponseEvent.response(SavedQueryDetail.fromSavedQuery(savedQuery));
@@ -434,13 +448,14 @@ public class QueryServiceImpl implements QueryService, InitializingBean {
 
 			SavedQueryDetail queryDetail = req.getPayload();
 
+			String aql = getAql(queryDetail);
 			Query.createQuery()
 				.wideRowMode(WideRowMode.DEEP)
 				.ic(!queryDetail.isCaseSensitive())
 				.dateFormat(ConfigUtil.getInstance().getDeDateFmt())
 				.timeFormat(ConfigUtil.getInstance().getTimeFmt())
 				.assessQueryRisk(riskAssessmentConfig)
-				.compile(cprForm, getAql(queryDetail));
+				.compile(getDrivingForm(null, queryDetail.getDrivingForm(), aql), aql);
 			SavedQuery savedQuery = getSavedQuery(queryDetail);
 			SavedQuery existing = daoFactory.getSavedQueryDao().getQuery(queryDetail.getId());
 			if (existing == null) {
@@ -513,7 +528,7 @@ public class QueryServiceImpl implements QueryService, InitializingBean {
 		Date startTime = null;
 		boolean queryCntIncremented = false;
 		try {
-			if (!opDetail.isDisableAccessChecks()) {
+			if (!opDetail.isDisableAccessChecks() && !opDetail.isCatalogQuery()) {
 				ensureReadRights();
 			}
 
@@ -1160,7 +1175,9 @@ public class QueryServiceImpl implements QueryService, InitializingBean {
 			}
 
 			AccessCtrlMgr.getInstance().ensureReadQueryRights();
-			return ResponseEvent.response(query.getQueryDefJson(true));
+			return ResponseEvent.response(query.getQueryDefJson(true, true));
+		} catch (OpenSpecimenException ose) {
+			return ResponseEvent.error(ose);
 		} catch (Exception e) {
 			return ResponseEvent.serverError(e);
 		}
@@ -1169,7 +1186,7 @@ public class QueryServiceImpl implements QueryService, InitializingBean {
 	@Override
 	@PlusTransactional
 	public QueryDataExportResult exportQueryData(final ExecuteQueryEventOp opDetail, final ExportProcessor processor) {
-		if (!opDetail.isDisableAccessChecks()) {
+		if (!opDetail.isDisableAccessChecks() && !opDetail.isCatalogQuery()) {
 			ensureReadRights();
 		}
 
@@ -1190,20 +1207,22 @@ public class QueryServiceImpl implements QueryService, InitializingBean {
 		GetFacetValuesOp op = req.getPayload();
 		DataSource queryDataSource = getReportingDataSource(op);
 		try {
-			if (!op.isDisableAccessChecks()) {
+			if (!op.isDisableAccessChecks() && !op.isCatalogQuery()) {
 				ensureReadRights();
 			}
 
 			QuerySpace qs = getQuerySpace(op.getQuerySpace());
+			String inputFields = String.join(", ", op.getFacets()) + " " + StringUtils.defaultString(op.getRestriction());
+			String rootForm = getDrivingForm(qs, op.getDrivingForm(), inputFields);
 			String restriction = qs == null
 				? getRestriction(
 					AuthUtil.getCurrentUser(),
-					op.getCpId(), op.getCpGroupId(), op.isDisableAccessChecks(),
-					queryId, queryDataSource)
+					op.getCpId(), op.getCpGroupId(), op.isDisableAccessChecks(), op.isCatalogQuery(),
+					queryId, queryDataSource, isCpOnlyQuery(inputFields))
 				: StringUtils.EMPTY;
 
 			List<FacetDetail> result = op.getFacets().stream()
-				.map(facet -> getFacetDetail(op, facet, restriction))
+				.map(facet -> getFacetDetail(op, facet, rootForm, restriction))
 				.collect(Collectors.toList());
 			return ResponseEvent.response(result);
 		} catch (OpenSpecimenException ose) {
@@ -1323,8 +1342,8 @@ public class QueryServiceImpl implements QueryService, InitializingBean {
 	private SavedQuery getSavedQuery(SavedQueryDetail detail) {
 		SavedQuery savedQuery = new SavedQuery();		
 		savedQuery.setTitle(detail.getTitle());
-		savedQuery.setCpId(detail.getCpId());
-		savedQuery.setCpGroupId(detail.getCpGroupId());
+		savedQuery.setCpId(getCpId(detail));
+		savedQuery.setCpGroupId(getCpGroupId(detail));
 		savedQuery.setSelectList(detail.getSelectList());
 		savedQuery.setFilters(detail.getFilters());
 		savedQuery.setSubQueries(Arrays.stream(detail.getFilters())
@@ -1346,12 +1365,89 @@ public class QueryServiceImpl implements QueryService, InitializingBean {
 		return savedQuery;
 	}
 
+	private Long getCpId(SavedQueryDetail detail) {
+		CollectionProtocol cp = getObject(detail.getCpId(), detail.getCpShortTitle(), this::getCp, CpErrorCode.NOT_FOUND);
+		return cp != null ? cp.getId() : null;
+	}
+
+	private CollectionProtocol getCp(Long cpId, String cpShortTitle) {
+		return StringUtils.isNotBlank(cpShortTitle)
+			? biospecimenDaoFactory.getCollectionProtocolDao().getCpByShortTitle(cpShortTitle)
+			: biospecimenDaoFactory.getCollectionProtocolDao().getById(cpId);
+	}
+
+	private Long getCpGroupId(SavedQueryDetail detail) {
+		CollectionProtocolGroup group = getObject(detail.getCpGroupId(), detail.getCpGroupName(), this::getCpGroup, CpGroupErrorCode.NOT_FOUND);
+		return group != null ? group.getId() : null;
+	}
+
+	private CollectionProtocolGroup getCpGroup(Long id, String name) {
+		return StringUtils.isNotBlank(name)
+			? biospecimenDaoFactory.getCpGroupDao().getByName(name)
+			: biospecimenDaoFactory.getCpGroupDao().getById(id);
+	}
+
+	private <T extends BaseEntity> T getObject(Long id, String name, BiFunction<Long, String, T> dbGetter, ErrorCode errorCode) {
+		boolean useName = StringUtils.isNotBlank(name);
+		if (!useName && (id == null || id == -1L)) {
+			return null;
+		}
+
+		T object = dbGetter.apply(id, name);
+		if (object == null) {
+			throw OpenSpecimenException.userError(errorCode, useName ? name : id);
+		}
+
+		return object;
+	}
+
 	private String getAql(SavedQueryDetail queryDetail) {
 		return AqlBuilder.getInstance().getQuery(
 			queryDetail.getSelectList(),
 			queryDetail.getFilters(),
 			queryDetail.getQueryExpression(),
 			queryDetail.getHavingClause());
+	}
+
+	private String getDrivingForm(QuerySpace qs, String drivingForm, String aql) {
+		if (qs != null) {
+			return StringUtils.defaultIfBlank(drivingForm, qs.getRootForm());
+		}
+
+		if (StringUtils.isNotBlank(drivingForm) && !cprForm.equals(drivingForm)) {
+			return drivingForm;
+		}
+
+		return isCpOnlyQuery(aql) ? cpForm : cprForm;
+	}
+
+	private QuerySpace getQuerySpaceWithRoot(QuerySpace qs, String rootForm) {
+		if (qs == null || Objects.equals(qs.getRootForm(), rootForm)) {
+			return qs;
+		}
+
+		QuerySpace result = new QuerySpace();
+		result.setName(qs.getName());
+		result.setForms(qs.getForms());
+		result.setPathConfig(qs.getPathConfig());
+		result.setRootForm(rootForm);
+		return result;
+	}
+
+	private boolean isCpOnlyQuery(String aql) {
+		Set<String> rootForms = new LinkedHashSet<>();
+		AQLLexer lexer = new AQLLexer(CharStreams.fromString(aql));
+		for (Token token : lexer.getAllTokens()) {
+			if (token.getType() == AQLLexer.FIELD) {
+				String field = token.getText();
+				rootForms.add(field.substring(0, field.indexOf('.')));
+				if (rootForms.size() >= 2) {
+					break; // it cannot be CP only query
+				}
+			}
+		}
+
+		return rootForms.size() == 1 && rootForms.contains(cpForm);
 	}
 
 	private Query getQuery(ExecuteQueryEventOp op, String queryId) {
@@ -1376,15 +1472,12 @@ public class QueryServiceImpl implements QueryService, InitializingBean {
 
 		if (StringUtils.isNotBlank(op.getQuerySpace())) {
 			QuerySpace qs = getQuerySpace(op.getQuerySpace());
-			query.querySpace(qs).compile(qs.getRootForm(), op.getAql());
+			String rootForm = getDrivingForm(qs, op.getDrivingForm(), op.getAql());
+			query.querySpace(getQuerySpaceWithRoot(qs, rootForm)).compile(rootForm, op.getAql());
 			return query;
 		}
 
-		String rootForm = cprForm;
-		if (StringUtils.isNotBlank(op.getDrivingForm())) {
-			rootForm = op.getDrivingForm();
-		}
-
+		String rootForm = getDrivingForm(null, op.getDrivingForm(), op.getAql());
 		query.compile(rootForm, op.getAql());
 
 		String aql = op.getAql();
@@ -1399,8 +1492,8 @@ public class QueryServiceImpl implements QueryService, InitializingBean {
 		query.compile(
 			rootForm, aql,
 			getRestriction(
-				user, op.getCpId(), op.getCpGroupId(), op.isDisableAccessChecks(),
-				queryId, queryDataSource
+				user, op.getCpId(), op.getCpGroupId(), op.isDisableAccessChecks(), op.isCatalogQuery(),
+				queryId, queryDataSource, isCpOnlyQuery(op.getAql())
 			)
 		);
 		op.setAql(aql);
@@ -1451,7 +1544,7 @@ public class QueryServiceImpl implements QueryService, InitializingBean {
 		return formattedResult;
 	}
 
-	private String getRestriction(User user, Long cpId, Long groupId, boolean disableAccessChecks, String queryId, DataSource queryDataSource) {
+	private String getRestriction(User user, Long cpId, Long groupId, boolean disableAccessChecks, boolean catalogQuery, String queryId, DataSource queryDataSource, boolean cpOnly) {
 		String restriction = null;
 		if (groupId != null && groupId > 0L) {
 			restriction = cpForm + ".cpGroup.id = " + groupId;
@@ -1462,15 +1555,29 @@ public class QueryServiceImpl implements QueryService, InitializingBean {
 		}
 
 		if (!user.isAdmin() && !disableAccessChecks) {
-			Set<SiteCpPair> siteCps = AccessCtrlMgr.getInstance().getReadableSiteCps();
+			Set<SiteCpPair> siteCps = catalogQuery && (cpId == null || cpId <= 0L)
+				? AccessCtrlMgr.getInstance().getCatalogReadableSiteCps()
+				: AccessCtrlMgr.getInstance().getReadableSiteCps();
 			if (CollectionUtils.isEmpty(siteCps)) {
 				throw OpenSpecimenException.userError(RbacErrorCode.ACCESS_DENIED);
 			}
 
-			restriction = appendRestriction(restriction, getSiteCpRestriction(queryDataSource, queryId, siteCps));
+			String accessRestriction = cpOnly
+				? getCpReadRestriction(siteCps)
+				: getSiteCpRestriction(queryDataSource, queryId, siteCps);
+			restriction = appendRestriction(restriction, accessRestriction);
 		}
 
 		return restriction;
+	}
+
+	private String getCpReadRestriction(Set<SiteCpPair> siteCps) {
+		if (CollectionUtils.isEmpty(siteCps)) {
+			throw OpenSpecimenException.userError(RbacErrorCode.ACCESS_DENIED);
+		}
+
+		String cpSitesCondition = BiospecimenDaoHelper.getInstance().getSiteCpsCondAqlForCps(siteCps);
+		return cpForm + ".id in (select " + cpForm + ".id where " + cpSitesCondition + ")";
 	}
 
 	private void insertSiteCpsInAclTable(DataSource queryDataSource, String queryId, Set<SiteCpPair> siteCps) {
@@ -2075,9 +2182,8 @@ public class QueryServiceImpl implements QueryService, InitializingBean {
 		NotifUtil.getInstance().notify(notif, Collections.singletonMap("folder-queries", sharedUsers));
 	}
 
-	private FacetDetail getFacetDetail(GetFacetValuesOp op, String facet, String restriction) {
+	private FacetDetail getFacetDetail(GetFacetValuesOp op, String facet, String rootForm, String restriction) {
 		String[] fieldParts = facet.split("\\.");
-		String rootForm = fieldParts[0];
 
 		int idx = fieldParts.length - 1;
 		while (idx >= 0) {
@@ -2136,7 +2242,6 @@ public class QueryServiceImpl implements QueryService, InitializingBean {
 		String restrictionCond = "";
 		if (StringUtils.isNotBlank(op.getRestriction())) {
 			restrictionCond = " and (" + op.getRestriction() + ")";
-			rootForm = qs != null ? qs.getRootForm() : cprForm;
 		}
 		aqlFmtArgs.add(restrictionCond);
 
@@ -2150,7 +2255,7 @@ public class QueryServiceImpl implements QueryService, InitializingBean {
 			.timeZone(tz != null ? tz.getID() : null)
 			.wideRowMode(WideRowMode.OFF)
 			.assessQueryRisk(riskAssessmentConfig)
-			.querySpace(qs);
+			.querySpace(getQuerySpaceWithRoot(qs, rootForm));
 		addAutoJoinParams(query);
 
 		QueryResultData queryResult = null;

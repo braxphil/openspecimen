@@ -2,8 +2,12 @@ package com.krishagni.catissueplus.core.de.events;
 
 import java.util.List;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
+
 public class GetFacetValuesOp {
 	private String querySpace;
+
+	private String drivingForm;
 
 	private Long cpId;
 
@@ -18,6 +22,13 @@ public class GetFacetValuesOp {
 	private boolean disableAccessChecks;
 
 	//
+	// Set only by trusted catalog services. Catalog queries do not require
+	// Query read rights. CP-scoped queries use CP read rights; unscoped
+	// queries use Catalog read rights.
+	//
+	private boolean catalogQuery;
+
+	//
 	// Not for use by the query client
 	//
 	private boolean useReportingDataSource;
@@ -28,6 +39,14 @@ public class GetFacetValuesOp {
 
 	public void setQuerySpace(String querySpace) {
 		this.querySpace = querySpace;
+	}
+
+	public String getDrivingForm() {
+		return drivingForm;
+	}
+
+	public void setDrivingForm(String drivingForm) {
+		this.drivingForm = drivingForm;
 	}
 
 	public Long getCpId() {
@@ -70,6 +89,7 @@ public class GetFacetValuesOp {
 		this.restriction = restriction;
 	}
 
+	@JsonIgnore
 	public boolean isDisableAccessChecks() {
 		return disableAccessChecks;
 	}
@@ -78,6 +98,16 @@ public class GetFacetValuesOp {
 		this.disableAccessChecks = disableAccessChecks;
 	}
 
+	@JsonIgnore
+	public boolean isCatalogQuery() {
+		return catalogQuery;
+	}
+
+	public void setCatalogQuery(boolean catalogQuery) {
+		this.catalogQuery = catalogQuery;
+	}
+
+	@JsonIgnore
 	public boolean isUseReportingDataSource() {
 		return useReportingDataSource;
 	}
